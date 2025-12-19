@@ -1,0 +1,10 @@
+.git
+*.swp
+*.swo
+*~
+test*.pl
+setenv.sh
+ddl.sql
+app.psgi
+nostr-relay2.pl
+lib/
