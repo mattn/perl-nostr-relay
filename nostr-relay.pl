@@ -94,28 +94,29 @@ sub match_filter {
     }
     
     # Check tags filters (e.g., #e, #p)
-    if ($ev->{tags} && ref $ev->{tags} eq 'ARRAY') {
-        for my $key (keys %$filter) {
-            if ($key =~ /^#([a-zA-Z])$/) {
-                my $tag_name = $1;
-                my $filter_values = $filter->{$key};
-                next unless ref $filter_values eq 'ARRAY';
-                
-                my @matching_tags = grep { 
-                    ref $_ eq 'ARRAY' && $_->[0] eq $tag_name 
-                } @{$ev->{tags}};
-                
-                return 0 unless @matching_tags;
-                
-                my $found = 0;
-                for my $tag (@matching_tags) {
-                    if ($tag->[1] && grep { $_ eq $tag->[1] } @$filter_values) {
-                        $found = 1;
-                        last;
-                    }
+    for my $key (keys %$filter) {
+        if ($key =~ /^#([a-zA-Z])$/) {
+            my $tag_name = $1;
+            my $filter_values = $filter->{$key};
+            next unless ref $filter_values eq 'ARRAY';
+
+            # If event has no tags, it cannot match tag filters
+            return 0 unless $ev->{tags} && ref $ev->{tags} eq 'ARRAY';
+
+            my @matching_tags = grep {
+                ref $_ eq 'ARRAY' && $_->[0] eq $tag_name
+            } @{$ev->{tags}};
+
+            return 0 unless @matching_tags;
+
+            my $found = 0;
+            for my $tag (@matching_tags) {
+                if ($tag->[1] && grep { $_ eq $tag->[1] } @$filter_values) {
+                    $found = 1;
+                    last;
                 }
-                return 0 unless $found;
             }
+            return 0 unless $found;
         }
     }
     
