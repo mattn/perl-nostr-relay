@@ -58,7 +58,7 @@ sub build_query {
     }
     
     my $where_clause = @where ? "WHERE " . join(" AND ", @where) : "";
-    my $limit = $filter->{limit} || 100;
+    my $limit = $filter->{limit} // 100;
     
     return ("SELECT id, pubkey, created_at, kind, tags, content, sig FROM event $where_clause ORDER BY created_at DESC LIMIT ?", [@params, $limit]);
 }
@@ -205,7 +205,7 @@ sub do_event {
             "INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig) VALUES (?, ?, ?, ?, ?, ?, ?)",
             undef,
             $ev->{id}, $ev->{pubkey}, $ev->{created_at}, $ev->{kind},
-            encode_json($ev->{tags} || []), $ev->{content} || '', $ev->{sig}
+            encode_json($ev->{tags} // []), $ev->{content} // '', $ev->{sig}
         );
     };
     if ($@) {
