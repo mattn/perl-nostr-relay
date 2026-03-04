@@ -144,19 +144,20 @@ sub verify_event {
     return (0, "invalid: event id does not match") unless $computed_id eq $ev->{id};
     
     # Verify Schnorr signature (BIP340)
+    my $sig_valid;
     eval {
         my $schnorr = Crypt::PK::ECC::Schnorr->new();
         # Import public key with secp256k1 curve
         $schnorr->import_key_raw(pack('H*', '02' . $ev->{pubkey}), 'secp256k1');
-        
+
         my $sig_bytes = pack('H*', $ev->{sig});
         my $msg_bytes = pack('H*', $ev->{id});
-        
-        my $valid = $schnorr->verify_message($msg_bytes, $sig_bytes);
-        return (0, "invalid: signature verification failed") unless $valid;
+
+        $sig_valid = $schnorr->verify_message($msg_bytes, $sig_bytes);
     };
-    
+
     return (0, "invalid: signature verification error: $@") if $@;
+    return (0, "invalid: signature verification failed") unless $sig_valid;
     return (1, "");
 }
 
