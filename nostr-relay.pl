@@ -191,14 +191,14 @@ sub do_event {
     unless (check_event($ev)) {
         my $response = Protocol::WebSocket::Frame->new(encode_json(["OK", "", JSON::PP::false, "invalid: invalid JSON"]))->to_bytes;
         $handle->push_write($response);
-        return;
+        return 0;
     }
 
     my ($valid, $err_msg) = verify_event($ev);
     if (!$valid) {
         my $response = Protocol::WebSocket::Frame->new(encode_json(["OK", $ev->{id}//"", JSON::PP::false, $err_msg]))->to_bytes;
         $handle->push_write($response);
-        return;
+        return 0;
     }
     eval {
         $dbh->do(
@@ -212,10 +212,12 @@ sub do_event {
         my $err = $@ =~ /duplicate key/ ? "duplicate: event already exists" : "error: $@";
         my $response = Protocol::WebSocket::Frame->new(encode_json(["OK", $ev->{id}, JSON::PP::false, $err]))->to_bytes;
         $handle->push_write($response);
-    } else {
-        my $response = Protocol::WebSocket::Frame->new(encode_json(["OK", $ev->{id}, JSON::PP::true, ""]))->to_bytes;
-        $handle->push_write($response);
+        return 0;
     }
+
+    my $response = Protocol::WebSocket::Frame->new(encode_json(["OK", $ev->{id}, JSON::PP::true, ""]))->to_bytes;
+    $handle->push_write($response);
+    return 1;
 }
 
 sub check_filter {
@@ -395,9 +397,9 @@ tcp_server '0.0.0.0', 8080, sub {
             if ($type eq 'EVENT') {
                 my $ev = $data->[1];
 
-                do_event($handle, $ev);
-
-                do_broadcast($ev);
+                if (do_event($handle, $ev)) {
+                    do_broadcast($ev);
+                }
             }
             elsif ($type eq 'REQ') {
                 my $sid = $data->[1];
