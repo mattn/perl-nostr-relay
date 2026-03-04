@@ -164,31 +164,31 @@ sub verify_event {
 sub check_event {
     my ($ev) = @_;
 
-    # Basic validation checks
-    return unless (ref $ev eq 'HASH');
+    # Basic validation checks - returns 1 if valid, 0 if invalid
+    return 0 unless ref $ev eq 'HASH';
     # Check if id is valid hex string (64 chars)
-    return unless (!$ev->{id} || $ev->{id} !~ /^[0-9a-f]{64}$/i);
+    return 0 unless $ev->{id} && $ev->{id} =~ /^[0-9a-f]{64}$/i;
     # Check if pubkey is valid hex string (64 chars)
-    return unless (!$ev->{pubkey} || $ev->{pubkey} !~ /^[0-9a-f]{64}$/i);
+    return 0 unless $ev->{pubkey} && $ev->{pubkey} =~ /^[0-9a-f]{64}$/i;
     # Check if sig is valid hex string (128 chars)
-    return unless (!$ev->{sig} || $ev->{sig} !~ /^[0-9a-f]{128}$/i);
+    return 0 unless $ev->{sig} && $ev->{sig} =~ /^[0-9a-f]{128}$/i;
     # Check if created_at is a valid integer
-    return unless (!defined($ev->{created_at}) || $ev->{created_at} !~ /^\d+$/);
+    return 0 unless defined($ev->{created_at}) && $ev->{created_at} =~ /^\d+$/;
     # Check if kind is a valid integer
-    return unless (!defined($ev->{kind}) || $ev->{kind} !~ /^\d+$/);
+    return 0 unless defined($ev->{kind}) && $ev->{kind} =~ /^\d+$/;
     # Check if tags is an array
-    return unless (!defined($ev->{tags}) || ref $ev->{tags} ne 'ARRAY');
+    return 0 unless defined($ev->{tags}) && ref $ev->{tags} eq 'ARRAY';
     # Check if content exists (can be empty string)
-    return unless (!defined($ev->{content}));
+    return 0 unless defined($ev->{content});
 
-    1;
+    return 1;
 }
 
 sub do_event {
     my ($handle, $ev) = @_;
 
     # Basic validation checks
-    unless (!check_event($ev)) {
+    unless (check_event($ev)) {
         my $response = Protocol::WebSocket::Frame->new(encode_json(["OK", "", JSON::PP::false, "invalid: invalid JSON"]))->to_bytes;
         $handle->push_write($response);
         return;
@@ -221,61 +221,49 @@ sub do_event {
 sub check_filter {
     my ($filter) = @_;
 
-    # Validate filter is an object
-    return unless (!defined($filter) || ref $filter ne 'HASH');
+    # Validate filter is an object - returns 1 if valid, 0 if invalid
+    return 0 unless defined($filter) && ref $filter eq 'HASH';
     # Validate filter fields
     for my $field (qw(ids authors kinds)) {
         if (exists $filter->{$field}) {
-            if (ref $filter->{$field} ne 'ARRAY') {
-                return;
-            }
-        }
-    }
-    
-    # Validate ids format (64 hex chars each)
-    if (exists $filter->{ids}) {
-        for my $id (@{$filter->{ids}}) {
-            if ($id !~ /^[0-9a-f]{64}$/i) {
-                return;
-            }
-        }
-    }
-    
-    # Validate authors format (64 hex chars each)
-    if (exists $filter->{authors}) {
-        for my $author (@{$filter->{authors}}) {
-            if ($author !~ /^[0-9a-f]{64}$/i) {
-                return;
-            }
-        }
-    }
-    
-    # Validate kinds (non-negative integers)
-    if (exists $filter->{kinds}) {
-        for my $kind (@{$filter->{kinds}}) {
-            if ($kind !~ /^\d+$/) {
-                return;
-            }
-        }
-    }
-    
-    # Validate since/until (integers)
-    for my $field (qw(since until)) {
-        if (exists $filter->{$field}) {
-            if ($filter->{$field} !~ /^\d+$/) {
-                return;
-            }
-        }
-    }
-    
-    # Validate limit (positive integer, max 5000)
-    if (exists $filter->{limit}) {
-        if ($filter->{limit} !~ /^\d+$/ || $filter->{limit} < 1 || $filter->{limit} > 5000) {
-            return;
+            return 0 unless ref $filter->{$field} eq 'ARRAY';
         }
     }
 
-    1;
+    # Validate ids format (64 hex chars each)
+    if (exists $filter->{ids}) {
+        for my $id (@{$filter->{ids}}) {
+            return 0 unless $id =~ /^[0-9a-f]{64}$/i;
+        }
+    }
+
+    # Validate authors format (64 hex chars each)
+    if (exists $filter->{authors}) {
+        for my $author (@{$filter->{authors}}) {
+            return 0 unless $author =~ /^[0-9a-f]{64}$/i;
+        }
+    }
+
+    # Validate kinds (non-negative integers)
+    if (exists $filter->{kinds}) {
+        for my $kind (@{$filter->{kinds}}) {
+            return 0 unless $kind =~ /^\d+$/;
+        }
+    }
+
+    # Validate since/until (integers)
+    for my $field (qw(since until)) {
+        if (exists $filter->{$field}) {
+            return 0 unless $filter->{$field} =~ /^\d+$/;
+        }
+    }
+
+    # Validate limit (positive integer, max 5000)
+    if (exists $filter->{limit}) {
+        return 0 unless $filter->{limit} =~ /^\d+$/ && $filter->{limit} >= 1 && $filter->{limit} <= 5000;
+    }
+
+    return 1;
 }
 
 
@@ -290,7 +278,7 @@ sub do_req {
     }
     
     # Validate filter is an object
-    unless (!check_filter($filter)) {
+    unless (check_filter($filter)) {
         my $response = Protocol::WebSocket::Frame->new(encode_json(["NOTICE", "invalid: filter must be an object"]))->to_bytes;
         $handle->push_write($response);
         return;
