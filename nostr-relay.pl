@@ -178,6 +178,91 @@ sub verify_event {
     return (1, "");
 }
 
+sub validate_delegation {
+    my ($ev) = @_;
+
+    # NIP-26: Delegated Event Signing
+    # Find delegation tag: ["delegation", <delegator pubkey>, <conditions>, <sig>]
+    my $delegation_tag;
+    for my $tag (@{$ev->{tags} // []}) {
+        if (ref $tag eq 'ARRAY' && @$tag >= 4 && ($tag->[0] // '') eq 'delegation') {
+            $delegation_tag = $tag;
+            last;
+        }
+    }
+
+    # No delegation tag, nothing to validate
+    return (1, "") unless $delegation_tag;
+
+    return (0, "invalid: malformed delegation tag") unless @$delegation_tag == 4;
+
+    my ($delegator_pubkey, $conditions, $signature) = @{$delegation_tag}[1, 2, 3];
+
+    return (0, "invalid: malformed delegation tag") unless
+        defined($delegator_pubkey) && $delegator_pubkey ne '' &&
+        defined($conditions) && $conditions ne '' &&
+        defined($signature) && $signature ne '';
+
+    # Delegator pubkey must be a 64 char hex string
+    return (0, "invalid: malformed delegation tag")
+        unless $delegator_pubkey =~ /^[0-9a-f]{64}$/i;
+
+    return (0, "invalid: delegation conditions not satisfied")
+        unless validate_delegation_conditions($ev, $conditions);
+
+    return (0, "invalid: delegation signature verification failed")
+        unless verify_delegation_signature($ev->{pubkey}, $delegator_pubkey, $conditions, $signature);
+
+    return (1, "");
+}
+
+sub validate_delegation_conditions {
+    my ($ev, $conditions) = @_;
+
+    my $kind_allowed = 0;
+    my $created_at_valid = 1;
+
+    for my $condition (split /&/, $conditions) {
+        if ($condition =~ /^kind=(\d+)$/) {
+            $kind_allowed = 1 if $ev->{kind} == $1;
+        }
+        elsif ($condition =~ /^created_at<(\d+)$/) {
+            $created_at_valid = 0 if $ev->{created_at} >= $1;
+        }
+        elsif ($condition =~ /^created_at>(\d+)$/) {
+            $created_at_valid = 0 if $ev->{created_at} <= $1;
+        }
+    }
+
+    return $kind_allowed && $created_at_valid;
+}
+
+sub verify_delegation_signature {
+    my ($delegatee_pubkey, $delegator_pubkey, $conditions, $signature) = @_;
+
+    # Signature must be a 64 byte hex string
+    return 0 unless $signature =~ /^[0-9a-f]{128}$/i;
+
+    # Delegation token: sha256("nostr:delegation:<delegatee pubkey>:<conditions>")
+    my $token = "nostr:delegation:$delegatee_pubkey:$conditions";
+    my $hash = sha256($token);
+
+    # Verify Schnorr signature (BIP340) by the delegator
+    my $sig_valid;
+    eval {
+        my $schnorr = Crypt::PK::ECC::Schnorr->new();
+        # Import public key with secp256k1 curve
+        $schnorr->import_key_raw(pack('H*', '02' . $delegator_pubkey), 'secp256k1');
+
+        my $sig_bytes = pack('H*', $signature);
+
+        $sig_valid = $schnorr->verify_message($hash, $sig_bytes);
+    };
+
+    return 0 if $@;
+    return $sig_valid ? 1 : 0;
+}
+
 sub check_event {
     my ($ev) = @_;
 
@@ -214,6 +299,14 @@ sub do_event {
     my ($valid, $err_msg) = verify_event($ev);
     if (!$valid) {
         my $response = Protocol::WebSocket::Frame->new(encode_json(["OK", $ev->{id}//"", JSON::PP::false, $err_msg]))->to_bytes;
+        $handle->push_write($response);
+        return 0;
+    }
+
+    # NIP-26: validate delegation tag if present
+    my ($delegation_valid, $delegation_err) = validate_delegation($ev);
+    if (!$delegation_valid) {
+        my $response = Protocol::WebSocket::Frame->new(encode_json(["OK", $ev->{id}, JSON::PP::false, $delegation_err]))->to_bytes;
         $handle->push_write($response);
         return 0;
     }
@@ -374,7 +467,7 @@ sub serve_nip11 {
         description => $ENV{RELAY_DESCRIPTION} // 'A simple Nostr relay implementation in Perl',
         pubkey => $ENV{RELAY_PUBKEY} // '',
         contact => $ENV{RELAY_CONTACT} // '',
-        supported_nips => [1, 2, 4, 9, 11, 12, 15, 16, 20, 22, 28, 33, 40, 70],
+        supported_nips => [1, 2, 4, 9, 11, 12, 15, 16, 20, 22, 26, 28, 33, 40, 70],
         software => 'perl-nostr-relay',
         version => '0.0.1',
     };
