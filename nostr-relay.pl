@@ -12,6 +12,22 @@ use Digest::SHA qw(sha256);
 use Crypt::PK::ECC::Schnorr;
 use Log::Minimal;
 use Data::Dumper;
+use File::Basename qw(dirname);
+
+my $public_dir = dirname(__FILE__) . '/public';
+
+my %mime_types = (
+    html => 'text/html',
+    css  => 'text/css',
+    js   => 'application/javascript',
+    json => 'application/json',
+    png  => 'image/png',
+    jpg  => 'image/jpeg',
+    jpeg => 'image/jpeg',
+    gif  => 'image/gif',
+    svg  => 'image/svg+xml',
+    ico  => 'image/x-icon',
+);
 
 # Database connection
 my $db_url = $ENV{DATABASE_URL} || die "DATABASE_URL not set";
@@ -337,6 +353,71 @@ sub do_broadcast {
     }
 }
 
+sub http_response {
+    my ($handle, $status, $headers, $body) = @_;
+
+    my $response = "HTTP/1.1 $status\r\n";
+    $response .= "$_: $headers->{$_}\r\n" for sort keys %$headers;
+    $response .= "Content-Length: " . length($body) . "\r\n";
+    $response .= "Connection: close\r\n";
+    $response .= "\r\n";
+    $response .= $body;
+    $handle->push_write($response);
+    $handle->on_drain(sub { $_[0]->destroy });
+}
+
+sub serve_nip11 {
+    my ($handle) = @_;
+
+    my $info = {
+        name => $ENV{RELAY_NAME} // 'Perl Nostr Relay',
+        description => $ENV{RELAY_DESCRIPTION} // 'A simple Nostr relay implementation in Perl',
+        pubkey => $ENV{RELAY_PUBKEY} // '',
+        contact => $ENV{RELAY_CONTACT} // '',
+        supported_nips => [1, 2, 4, 9, 11, 12, 15, 16, 20, 22, 28, 33, 40, 70],
+        software => 'perl-nostr-relay',
+        version => '0.0.1',
+    };
+    $info->{url} = $ENV{RELAY_URL} if $ENV{RELAY_URL};
+    $info->{icon} = $ENV{RELAY_ICON} if $ENV{RELAY_ICON};
+
+    http_response($handle, '200 OK', {
+        'Content-Type' => 'application/nostr+json',
+        'Access-Control-Allow-Origin' => '*',
+        'Access-Control-Allow-Headers' => 'Content-Type, Accept',
+        'Access-Control-Allow-Methods' => 'GET',
+    }, encode_json($info));
+}
+
+sub serve_static {
+    my ($handle, $path) = @_;
+
+    $path =~ s/[?#].*//;
+    $path =~ s/%([0-9A-Fa-f]{2})/chr(hex($1))/eg;
+    $path = '/index.html' if $path eq '/';
+
+    if ($path =~ /\.\./ || $path !~ m{^/[0-9A-Za-z._\-/]+$}) {
+        http_response($handle, '404 Not Found', {'Content-Type' => 'text/plain'}, '404 Not Found');
+        return;
+    }
+
+    my ($ext) = $path =~ /\.([0-9A-Za-z]+)$/;
+    my $file = "$public_dir$path";
+    unless ($ext && $mime_types{lc $ext} && -f $file) {
+        http_response($handle, '404 Not Found', {'Content-Type' => 'text/plain'}, '404 Not Found');
+        return;
+    }
+
+    open my $fh, '<:raw', $file or do {
+        http_response($handle, '404 Not Found', {'Content-Type' => 'text/plain'}, '404 Not Found');
+        return;
+    };
+    my $body = do { local $/; <$fh> };
+    close $fh;
+
+    http_response($handle, '200 OK', {'Content-Type' => $mime_types{lc $ext}}, $body);
+}
+
 tcp_server '0.0.0.0', 8080, sub {
     my ($fh) = @_;
     
@@ -345,6 +426,8 @@ tcp_server '0.0.0.0', 8080, sub {
     
     my $hs = Protocol::WebSocket::Handshake::Server->new;
     my $frame = Protocol::WebSocket::Frame->new;
+    my $http_buf = '';
+    my $is_websocket = 0;
     
     my $handle; $handle = AnyEvent::Handle->new(
         fh => $fh,
@@ -372,6 +455,36 @@ tcp_server '0.0.0.0', 8080, sub {
         $handle->{rbuf} = '';
         
         if (!$hs->is_done) {
+            if (!$is_websocket) {
+                $http_buf .= $chunk;
+                return unless $http_buf =~ /\r\n\r\n/;
+
+                my ($head) = split /\r\n\r\n/, $http_buf, 2;
+                my @lines = split /\r\n/, $head;
+                my $request_line = shift @lines // '';
+                my %headers;
+                for my $line (@lines) {
+                    my ($k, $v) = split /:\s*/, $line, 2;
+                    $headers{lc $k} = $v // '' if defined $k;
+                }
+
+                if (($headers{upgrade} // '') =~ /websocket/i) {
+                    $is_websocket = 1;
+                    $chunk = $http_buf;
+                }
+                elsif (($headers{accept} // '') =~ m{application/nostr\+json}) {
+                    my ($path) = $request_line =~ m{^\S+\s+(\S+)};
+                    infof("NIP-11 request: %s", $path // '/');
+                    serve_nip11($handle);
+                    return;
+                }
+                else {
+                    my ($path) = $request_line =~ m{^GET\s+(\S+)};
+                    infof("HTTP request: %s", $path // '(bad request)');
+                    serve_static($handle, $path // '/');
+                    return;
+                }
+            }
             $hs->parse($chunk);
             if ($hs->is_done) {
                 my $response = $hs->to_string;

@@ -40,6 +40,7 @@ COPY --from=builder /usr/local/share/perl5 /usr/local/share/perl5
 COPY --from=builder /usr/local/lib/perl5 /usr/local/lib/perl5
 
 COPY --from=builder /app/nostr-relay.pl /app/nostr-relay.pl
+COPY public /app/public
 
 WORKDIR /app
 
