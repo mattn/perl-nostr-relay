@@ -1,3 +1,4 @@
+kustomize
 *.sh
 test*
 .claude/settings.local.json
