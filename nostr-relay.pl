@@ -36,12 +36,24 @@ my ($user, $pass, $host, $port, $dbname) = $db_url =~ m{^[^:]+://([^:]+):([^@]+)
     or die "Invalid DATABASE_URL format";
 $pass =~ s/%([0-9A-Fa-f]{2})/chr(hex($1))/eg;  # URL decode password
 
-my $dbh = DBI->connect(
-    "dbi:Pg:dbname=$dbname;host=$host;port=$port",
-    $user,
-    $pass,
-    {AutoCommit => 1, RaiseError => 1, pg_enable_utf8 => 1}
-) or die "Cannot connect to database: $DBI::errstr";
+sub connect_db {
+    return DBI->connect(
+        "dbi:Pg:dbname=$dbname;host=$host;port=$port",
+        $user,
+        $pass,
+        {AutoCommit => 1, RaiseError => 1, pg_enable_utf8 => 1}
+    );
+}
+
+my $dbh = connect_db() or die "Cannot connect to database: $DBI::errstr";
+
+sub get_dbh {
+    unless ($dbh && eval { $dbh->ping }) {
+        infof("Database connection lost, reconnecting");
+        $dbh = connect_db();
+    }
+    return $dbh;
+}
 
 # Global subscriptions across all connections
 my $all_subs = {};
@@ -311,7 +323,7 @@ sub do_event {
         return 0;
     }
     eval {
-        $dbh->do(
+        get_dbh()->do(
             "INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig) VALUES (?, ?, ?, ?, ?, ?, ?)",
             undef,
             $ev->{id}, $ev->{pubkey}, $ev->{created_at}, $ev->{kind},
@@ -403,23 +415,36 @@ sub do_req {
     };
 
     my ($query, $params) = build_query($filter);
-    my $sth = $dbh->prepare($query);
-    $sth->execute(@$params);
-    
-    while (my $row = $sth->fetchrow_hashref) {
+    my @rows;
+    eval {
+        my $sth = get_dbh()->prepare($query);
+        $sth->execute(@$params);
+        while (my $row = $sth->fetchrow_hashref) {
+            push @rows, $row;
+        }
+    };
+    if ($@) {
+        warnf("Query failed: %s", $@);
+        delete $all_subs->{$sub_key};
+        my $response = Protocol::WebSocket::Frame->new(encode_json(["CLOSED", $sid, "error: could not query events"]))->to_bytes;
+        $handle->push_write($response);
+        return;
+    }
+
+    for my $row (@rows) {
         my $ev = {
             id => $row->{id},
             pubkey => $row->{pubkey},
             created_at => $row->{created_at},
             kind => $row->{kind},
-            tags => decode_json($row->{tags}),
+            tags => (eval { decode_json($row->{tags}) } // []),
             content => $row->{content},
             sig => $row->{sig}
         };
         my $response = Protocol::WebSocket::Frame->new(encode_json(["EVENT", $sid, $ev]))->to_bytes;
         $handle->push_write($response);
     }
-    
+
     my $eose = Protocol::WebSocket::Frame->new(encode_json(["EOSE", $sid]))->to_bytes;
     $handle->push_write($eose);
 }
@@ -518,7 +543,7 @@ tcp_server '0.0.0.0', 8080, sub {
     infof("New connection: %s", $conn_id);
     
     my $hs = Protocol::WebSocket::Handshake::Server->new;
-    my $frame = Protocol::WebSocket::Frame->new;
+    my $frame = Protocol::WebSocket::Frame->new(max_payload_size => 1024 * 1024);
     my $http_buf = '';
     my $is_websocket = 0;
     
@@ -587,11 +612,23 @@ tcp_server '0.0.0.0', 8080, sub {
             return;
         }
         
+        my $parsed_ok = eval {
         $frame->append($chunk);
-        
-        while (my $msg = $frame->next_bytes) {
+
+        while (defined(my $msg = $frame->next_bytes)) {
+            if ($frame->is_ping) {
+                $handle->push_write(Protocol::WebSocket::Frame->new(type => 'pong', buffer => $msg)->to_bytes);
+                next;
+            }
+            if ($frame->is_close) {
+                $handle->push_write(Protocol::WebSocket::Frame->new(type => 'close')->to_bytes);
+                $handle->push_shutdown;
+                last;
+            }
+            next if $frame->is_pong;
+
             infof("Received message: %s", substr($msg, 0, 100) . (length($msg) > 100 ? "..." : ""));
-            
+
             my $data = eval { decode_json($msg) };
             if ($@ || ref $data ne 'ARRAY') {
                 warnf("Invalid JSON or not an array: %s", $@) if $@;
@@ -619,6 +656,15 @@ tcp_server '0.0.0.0', 8080, sub {
                 my $sub_key = "$conn_id:$sid";
                 delete $all_subs->{$sub_key};
             }
+        }
+        1;
+        };
+        unless ($parsed_ok) {
+            warnf("Closing %s due to frame error: %s", $conn_id, $@);
+            for my $key (keys %$all_subs) {
+                delete $all_subs->{$key} if $key =~ /^\Q$conn_id\E:/;
+            }
+            $handle->destroy;
         }
     });
 }, sub {
