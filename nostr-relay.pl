@@ -84,7 +84,19 @@ sub build_query {
         push @where, "created_at <= ?";
         push @params, $filter->{until};
     }
-    
+
+    # Tag filters (e.g. #e, #p): tagvalues && ? narrows via the GIN index,
+    # the EXISTS clause checks the tag name exactly
+    for my $key (sort keys %$filter) {
+        if ($key =~ /^#([a-zA-Z])$/) {
+            my $tag_name = $1;
+            my $values = $filter->{$key};
+            next unless ref $values eq 'ARRAY' && @$values;
+            push @where, "(tagvalues && ?::text[] AND EXISTS (SELECT 1 FROM jsonb_array_elements(tags) tag WHERE tag->>0 = ? AND tag->>1 = ANY(?)))";
+            push @params, $values, $tag_name, $values;
+        }
+    }
+
     my $where_clause = @where ? "WHERE " . join(" AND ", @where) : "";
     my $limit = $filter->{limit} // 100;
     
@@ -385,6 +397,16 @@ sub check_filter {
     # Validate limit (positive integer, max 5000)
     if (exists $filter->{limit}) {
         return 0 unless $filter->{limit} =~ /^\d+$/ && $filter->{limit} >= 1 && $filter->{limit} <= 5000;
+    }
+
+    # Validate tag filters (#e, #p, ...): must be arrays of strings
+    for my $key (keys %$filter) {
+        if ($key =~ /^#[a-zA-Z]$/) {
+            return 0 unless ref $filter->{$key} eq 'ARRAY';
+            for my $value (@{$filter->{$key}}) {
+                return 0 if ref $value || !defined $value;
+            }
+        }
     }
 
     return 1;
