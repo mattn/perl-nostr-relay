@@ -334,6 +334,36 @@ sub do_event {
         $handle->push_write($response);
         return 0;
     }
+
+    # NIP-09: deletion request; run before the insert so resending an
+    # already stored deletion event still deletes its targets
+    if ($ev->{kind} == 5) {
+        eval {
+            my $dbh = get_dbh();
+            for my $tag (@{$ev->{tags} // []}) {
+                next unless ref $tag eq 'ARRAY' && ($tag->[0] // '') eq 'e' && $tag->[1];
+                my $row = $dbh->selectrow_hashref("SELECT kind, pubkey, tags FROM event WHERE id = ?", undef, $tag->[1]);
+                next unless $row;
+                if ($row->{kind} == 1059) {
+                    # Gift wrap: the recipient (first p tag) may delete it
+                    my $tags = eval { decode_json($row->{tags}) } // [];
+                    next unless ref $tags eq 'ARRAY' && ref $tags->[0] eq 'ARRAY'
+                        && ($tags->[0][0] // '') eq 'p' && ($tags->[0][1] // '') eq $ev->{pubkey};
+                    $dbh->do("DELETE FROM event WHERE id = ?", undef, $tag->[1]);
+                }
+                else {
+                    $dbh->do("DELETE FROM event WHERE id = ? AND pubkey = ?", undef, $tag->[1], $ev->{pubkey});
+                }
+            }
+        };
+        if ($@) {
+            warnf("Deletion failed: %s", $@);
+            my $response = Protocol::WebSocket::Frame->new(encode_json(["OK", $ev->{id}, JSON::PP::false, "error: failed to delete event"]))->to_bytes;
+            $handle->push_write($response);
+            return 0;
+        }
+    }
+
     eval {
         get_dbh()->do(
             "INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig) VALUES (?, ?, ?, ?, ?, ?, ?)",
