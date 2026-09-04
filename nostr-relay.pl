@@ -364,6 +364,37 @@ sub do_event {
         }
     }
 
+    # NIP-01/NIP-78: parameterized replaceable events.  kind 30078 is
+    # addressable by the first `d` tag, so remove older events with the same
+    # kind, author, and identifier before storing the new event.
+    if ($ev->{kind} >= 30000 && $ev->{kind} < 40000) {
+        my ($dtag) = map { $_->[1] }
+            grep { ref $_ eq 'ARRAY' && @$_ >= 2 && $_->[0] eq 'd' }
+            @{$ev->{tags} // []};
+        if (defined $dtag) {
+            eval {
+                my $dbh = get_dbh();
+                my $rows = $dbh->selectall_arrayref(
+                    "SELECT id, tags FROM event WHERE kind = ? AND pubkey = ? AND created_at < ?",
+                    { Slice => {} }, $ev->{kind}, $ev->{pubkey}, $ev->{created_at});
+                for my $row (@$rows) {
+                    my $tags = eval { decode_json($row->{tags}) } // [];
+                    my ($old_dtag) = map { $_->[1] }
+                        grep { ref $_ eq 'ARRAY' && @$_ >= 2 && $_->[0] eq 'd' }
+                        @$tags;
+                    $dbh->do("DELETE FROM event WHERE id = ?", undef, $row->{id})
+                        if defined $old_dtag && $old_dtag eq $dtag;
+                }
+            };
+            if ($@) {
+                warnf("Parameterized replacement failed: %s", $@);
+                my $response = Protocol::WebSocket::Frame->new(encode_json(["OK", $ev->{id}, JSON::PP::false, "error: failed to replace event"]))->to_bytes;
+                $handle->push_write($response);
+                return 0;
+            }
+        }
+    }
+
     eval {
         get_dbh()->do(
             "INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig) VALUES (?, ?, ?, ?, ?, ?, ?)",
