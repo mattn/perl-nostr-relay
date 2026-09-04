@@ -424,9 +424,10 @@ sub check_filter {
         }
     }
 
-    # Validate limit (positive integer, max 5000)
+    # Validate limit (non-negative integer, max 5000).  Zero requests no
+    # stored events while leaving the subscription active after EOSE.
     if (exists $filter->{limit}) {
-        return 0 unless $filter->{limit} =~ /^\d+$/ && $filter->{limit} >= 1 && $filter->{limit} <= 5000;
+        return 0 unless $filter->{limit} =~ /^\d+$/ && $filter->{limit} <= 5000;
     }
 
     # Validate tag filters (#e, #p, ...): must be arrays of strings
