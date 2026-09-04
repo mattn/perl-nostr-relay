@@ -60,7 +60,7 @@ my $all_subs = {};
 my $conn_counter = 0;
 
 sub build_query {
-    my ($filter) = @_;
+    my ($filter, $count_only) = @_;
     my @where;
     my @params;
     
@@ -98,6 +98,9 @@ sub build_query {
     }
 
     my $where_clause = @where ? "WHERE " . join(" AND ", @where) : "";
+    if ($count_only) {
+        return ("SELECT id FROM event $where_clause", \@params);
+    }
     my $limit = $filter->{limit} // 100;
     
     return ("SELECT id, pubkey, created_at, kind, tags, content, sig FROM event $where_clause ORDER BY created_at DESC LIMIT ?", [@params, $limit]);
@@ -533,6 +536,42 @@ sub do_req {
     $handle->push_write($eose);
 }
 
+sub do_count {
+    my ($handle, $sid, $filters) = @_;
+
+    if (!defined($sid) || $sid eq '') {
+        my $response = Protocol::WebSocket::Frame->new(encode_json(["CLOSED", $sid // "", "error: query id is required"]))->to_bytes;
+        $handle->push_write($response);
+        return;
+    }
+    unless (ref $filters eq 'ARRAY' && @$filters && !grep { !check_filter($_) } @$filters) {
+        my $response = Protocol::WebSocket::Frame->new(encode_json(["CLOSED", $sid, "error: invalid filter"]))->to_bytes;
+        $handle->push_write($response);
+        return;
+    }
+
+    my %event_ids;
+    eval {
+        for my $filter (@$filters) {
+            my ($query, $params) = build_query($filter, 1);
+            my $sth = get_dbh()->prepare($query);
+            $sth->execute(@$params);
+            while (my ($id) = $sth->fetchrow_array) {
+                $event_ids{$id} = 1;
+            }
+        }
+    };
+    if ($@) {
+        warnf("COUNT query failed: %s", $@);
+        my $response = Protocol::WebSocket::Frame->new(encode_json(["CLOSED", $sid, "error: could not count events"]))->to_bytes;
+        $handle->push_write($response);
+        return;
+    }
+
+    my $response = Protocol::WebSocket::Frame->new(encode_json(["COUNT", $sid, { count => scalar keys %event_ids }]))->to_bytes;
+    $handle->push_write($response);
+}
+
 sub do_broadcast {
     my ($ev) = @_;
 
@@ -576,7 +615,7 @@ sub serve_nip11 {
         description => $ENV{RELAY_DESCRIPTION} // 'A simple Nostr relay implementation in Perl',
         pubkey => $ENV{RELAY_PUBKEY} // '',
         contact => $ENV{RELAY_CONTACT} // '',
-        supported_nips => [1, 4, 9, 11, 26, 40, 66, 70, 78],
+        supported_nips => [1, 4, 9, 11, 26, 40, 45, 66, 70, 78],
         software => 'perl-nostr-relay',
         version => '0.0.1',
     };
@@ -734,6 +773,11 @@ tcp_server '0.0.0.0', 8080, sub {
                 my $filter = $data->[2] // {};
                 
                 do_req($handle, $sid, $filter, $conn_id);
+            }
+            elsif ($type eq 'COUNT') {
+                my $sid = $data->[1];
+                my @filters = @$data[2 .. $#$data];
+                do_count($handle, $sid, \@filters);
             }
             elsif ($type eq 'CLOSE') {
                 my $sid = $data->[1];
