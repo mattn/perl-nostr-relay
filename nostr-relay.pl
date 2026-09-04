@@ -545,7 +545,7 @@ sub serve_nip11 {
         description => $ENV{RELAY_DESCRIPTION} // 'A simple Nostr relay implementation in Perl',
         pubkey => $ENV{RELAY_PUBKEY} // '',
         contact => $ENV{RELAY_CONTACT} // '',
-        supported_nips => [1, 2, 4, 9, 11, 12, 15, 16, 20, 22, 26, 28, 33, 40, 70],
+        supported_nips => [1, 4, 9, 11, 26, 40, 70],
         software => 'perl-nostr-relay',
         version => '0.0.1',
     };
