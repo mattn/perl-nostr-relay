@@ -60,7 +60,7 @@ my $all_subs = {};
 my $conn_counter = 0;
 
 sub build_query {
-    my ($filter, $count_only) = @_;
+    my ($filter, $count_only, $authenticated_pubkeys) = @_;
     my @where;
     my @params;
     
@@ -83,6 +83,17 @@ sub build_query {
     if ($filter->{until}) {
         push @where, "created_at <= ?";
         push @params, $filter->{until};
+    }
+
+    # NIP-17: gift wraps are visible only to an authenticated p-tagged
+    # recipient. This applies even to broad filters and COUNT queries.
+    my @auth_pubkeys = sort keys %{$authenticated_pubkeys // {}};
+    if (@auth_pubkeys) {
+        push @where, "(kind <> 1059 OR EXISTS (SELECT 1 FROM jsonb_array_elements(tags) tag WHERE tag->>0 = 'p' AND tag->>1 = ANY(?)))";
+        push @params, \@auth_pubkeys;
+    }
+    else {
+        push @where, "kind <> 1059";
     }
 
     # Tag filters (e.g. #e, #p): tagvalues && ? narrows via the GIN index,
@@ -314,7 +325,7 @@ sub check_event {
 }
 
 sub do_event {
-    my ($handle, $ev) = @_;
+    my ($handle, $ev, $authenticated_pubkeys) = @_;
 
     # Basic validation checks
     unless (check_event($ev)) {
@@ -334,6 +345,16 @@ sub do_event {
     my ($delegation_valid, $delegation_err) = validate_delegation($ev);
     if (!$delegation_valid) {
         my $response = Protocol::WebSocket::Frame->new(encode_json(["OK", $ev->{id}, JSON::PP::false, $delegation_err]))->to_bytes;
+        $handle->push_write($response);
+        return 0;
+    }
+
+    # NIP-70: protected events require authentication as their author.
+    my $protected = grep {
+        ref $_ eq 'ARRAY' && ($_->[0] // '') eq '-'
+    } @{$ev->{tags} // []};
+    if ($protected && !$authenticated_pubkeys->{$ev->{pubkey}}) {
+        my $response = Protocol::WebSocket::Frame->new(encode_json(["OK", $ev->{id}, JSON::PP::false, "auth-required: this event may only be published by its author"]))->to_bytes;
         $handle->push_write($response);
         return 0;
     }
@@ -477,9 +498,55 @@ sub check_filter {
     return 1;
 }
 
+sub normalize_relay_url {
+    my ($url) = @_;
+    return '' unless defined $url;
+    $url = lc $url;
+    $url =~ s{/+$}{};
+    return $url;
+}
+
+sub do_auth {
+    my ($handle, $ev, $challenge, $relay_url, $authenticated_pubkeys) = @_;
+    my $id = ref $ev eq 'HASH' ? ($ev->{id} // '') : '';
+    my $reject = sub {
+        my ($message) = @_;
+        $handle->push_write(Protocol::WebSocket::Frame->new(
+            encode_json(["OK", $id, JSON::PP::false, "invalid: $message"])
+        )->to_bytes);
+    };
+
+    return $reject->('malformed authentication event') unless ref $ev eq 'HASH';
+    return $reject->('authentication event must be kind 22242') unless ($ev->{kind} // -1) == 22242;
+    return $reject->('authentication event timestamp is out of range')
+        unless defined($ev->{created_at}) && abs(time() - $ev->{created_at}) <= 600;
+    return $reject->('authentication event tags are malformed') unless ref $ev->{tags} eq 'ARRAY';
+
+    my $challenge_matches = grep {
+        ref $_ eq 'ARRAY' && ($_->[0] // '') eq 'challenge' && ($_->[1] // '') eq $challenge
+    } @{$ev->{tags}};
+    return $reject->('authentication challenge does not match') unless $challenge_matches;
+
+    my $expected_relay = normalize_relay_url($relay_url);
+    my $relay_matches = grep {
+        ref $_ eq 'ARRAY' && ($_->[0] // '') eq 'relay'
+            && normalize_relay_url($_->[1]) eq $expected_relay
+    } @{$ev->{tags}};
+    return $reject->('authentication relay does not match') unless $relay_matches;
+
+    my ($valid, $message) = verify_event($ev);
+    return $reject->($message) unless $valid;
+
+    $authenticated_pubkeys->{$ev->{pubkey}} = 1;
+    $handle->push_write(Protocol::WebSocket::Frame->new(
+        encode_json(["OK", $id, JSON::PP::true, ""])
+    )->to_bytes);
+    return 1;
+}
+
 
 sub do_req {
-    my ($handle, $sid, $filter, $conn_id) = @_;
+    my ($handle, $sid, $filter, $conn_id, $authenticated_pubkeys) = @_;
     
     # Validate subscription id
     if (!defined($sid) || $sid eq '') {
@@ -499,9 +566,10 @@ sub do_req {
     $all_subs->{$sub_key} = {
         filter => $filter,
         handle => $handle,
+        authenticated_pubkeys => $authenticated_pubkeys,
     };
 
-    my ($query, $params) = build_query($filter);
+    my ($query, $params) = build_query($filter, 0, $authenticated_pubkeys);
     my @rows;
     eval {
         my $sth = get_dbh()->prepare($query);
@@ -537,7 +605,7 @@ sub do_req {
 }
 
 sub do_count {
-    my ($handle, $sid, $filters) = @_;
+    my ($handle, $sid, $filters, $authenticated_pubkeys) = @_;
 
     if (!defined($sid) || $sid eq '') {
         my $response = Protocol::WebSocket::Frame->new(encode_json(["CLOSED", $sid // "", "error: query id is required"]))->to_bytes;
@@ -553,7 +621,7 @@ sub do_count {
     my %event_ids;
     eval {
         for my $filter (@$filters) {
-            my ($query, $params) = build_query($filter, 1);
+            my ($query, $params) = build_query($filter, 1, $authenticated_pubkeys);
             my $sth = get_dbh()->prepare($query);
             $sth->execute(@$params);
             while (my ($id) = $sth->fetchrow_array) {
@@ -582,6 +650,13 @@ sub do_broadcast {
         
         next unless $handle;
         next unless match_filter($ev, $filter);
+        if ($ev->{kind} == 1059) {
+            my $auth = $sub->{authenticated_pubkeys} // {};
+            my $recipient = grep {
+                ref $_ eq 'ARRAY' && ($_->[0] // '') eq 'p' && $auth->{$_->[1] // ''}
+            } @{$ev->{tags} // []};
+            next unless $recipient;
+        }
 
         my ($conn_id, $sid) = split /:/, $sub_key, 2;
         my $response = Protocol::WebSocket::Frame->new(encode_json(["EVENT", $sid, $ev]))->to_bytes;
@@ -615,7 +690,7 @@ sub serve_nip11 {
         description => $ENV{RELAY_DESCRIPTION} // 'A simple Nostr relay implementation in Perl',
         pubkey => $ENV{RELAY_PUBKEY} // '',
         contact => $ENV{RELAY_CONTACT} // '',
-        supported_nips => [1, 4, 9, 11, 26, 40, 45, 66, 70, 78],
+        supported_nips => [1, 4, 9, 11, 17, 26, 40, 42, 45, 59, 66, 70, 78],
         software => 'perl-nostr-relay',
         version => '0.0.1',
     };
@@ -669,6 +744,9 @@ tcp_server '0.0.0.0', 8080, sub {
     my $frame = Protocol::WebSocket::Frame->new(max_payload_size => 1024 * 1024);
     my $http_buf = '';
     my $is_websocket = 0;
+    my $challenge = unpack('H*', sha256(join(':', rand(), time(), $conn_id)));
+    my $authenticated_pubkeys = {};
+    my $relay_url = $ENV{RELAY_URL} // '';
     
     my $handle; $handle = AnyEvent::Handle->new(
         fh => $fh,
@@ -709,6 +787,12 @@ tcp_server '0.0.0.0', 8080, sub {
                     $headers{lc $k} = $v // '' if defined $k;
                 }
 
+                my $forwarded_host = $headers{'x-forwarded-host'} // $headers{host} // '';
+                $forwarded_host =~ s/,.*//;
+                my $forwarded_proto = lc($headers{'x-forwarded-proto'} // 'https');
+                my $ws_scheme = $forwarded_proto eq 'http' ? 'ws' : 'wss';
+                $relay_url = "$ws_scheme://$forwarded_host" if $forwarded_host ne '';
+
                 if (($headers{upgrade} // '') =~ /websocket/i) {
                     $is_websocket = 1;
                     $chunk = $http_buf;
@@ -731,6 +815,9 @@ tcp_server '0.0.0.0', 8080, sub {
                 my $response = $hs->to_string;
                 $response =~ s/Upgrade: WebSocket/Upgrade: websocket/;
                 $handle->push_write($response);
+                $handle->push_write(Protocol::WebSocket::Frame->new(
+                    encode_json(["AUTH", $challenge])
+                )->to_bytes);
             }
             return;
         }
@@ -764,7 +851,7 @@ tcp_server '0.0.0.0', 8080, sub {
             if ($type eq 'EVENT') {
                 my $ev = $data->[1];
 
-                if (do_event($handle, $ev)) {
+                if (do_event($handle, $ev, $authenticated_pubkeys)) {
                     do_broadcast($ev);
                 }
             }
@@ -772,12 +859,15 @@ tcp_server '0.0.0.0', 8080, sub {
                 my $sid = $data->[1];
                 my $filter = $data->[2] // {};
                 
-                do_req($handle, $sid, $filter, $conn_id);
+                do_req($handle, $sid, $filter, $conn_id, $authenticated_pubkeys);
             }
             elsif ($type eq 'COUNT') {
                 my $sid = $data->[1];
                 my @filters = @$data[2 .. $#$data];
-                do_count($handle, $sid, \@filters);
+                do_count($handle, $sid, \@filters, $authenticated_pubkeys);
+            }
+            elsif ($type eq 'AUTH') {
+                do_auth($handle, $data->[1], $challenge, $relay_url, $authenticated_pubkeys);
             }
             elsif ($type eq 'CLOSE') {
                 my $sid = $data->[1];
