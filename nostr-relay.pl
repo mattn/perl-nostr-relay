@@ -59,6 +59,22 @@ sub get_dbh {
 my $all_subs = {};
 my $conn_counter = 0;
 
+# NIP-50: split a search string into words. An event matches when every word
+# occurs in its content, which is also how match_filter decides, so stored and
+# live results agree.
+sub search_words {
+    my ($search) = @_;
+    return () unless defined $search && !ref $search;
+    return grep { length } split /\s+/, $search;
+}
+
+# Escape the LIKE wildcards so a search for '%' cannot match everything.
+sub escape_like {
+    my ($word) = @_;
+    $word =~ s/([\\%_])/\\$1/g;
+    return $word;
+}
+
 sub build_query {
     my ($filter, $count_only, $authenticated_pubkeys) = @_;
     my @where;
@@ -83,6 +99,12 @@ sub build_query {
     if ($filter->{until}) {
         push @where, "created_at <= ?";
         push @params, $filter->{until};
+    }
+
+    # NIP-50: every word of the search string must occur in the content
+    for my $word (search_words($filter->{search})) {
+        push @where, "content ILIKE ?";
+        push @params, '%' . escape_like($word) . '%';
     }
 
     # NIP-17: gift wraps are visible only to an authenticated p-tagged
@@ -145,6 +167,15 @@ sub match_filter {
     # Check until filter
     if ($filter->{until} && $ev->{created_at} > $filter->{until}) {
         return 0;
+    }
+
+    # Check search filter (NIP-50)
+    my @search_words = search_words($filter->{search});
+    if (@search_words) {
+        my $content = lc($ev->{content} // '');
+        for my $word (@search_words) {
+            return 0 unless index($content, lc $word) >= 0;
+        }
     }
     
     # Check tags filters (e.g., #e, #p)
@@ -485,6 +516,11 @@ sub check_filter {
         return 0 unless $filter->{limit} =~ /^\d+$/ && $filter->{limit} <= 5000;
     }
 
+    # Validate search (NIP-50): must be a plain string
+    if (exists $filter->{search}) {
+        return 0 if ref $filter->{search};
+    }
+
     # Validate tag filters (#e, #p, ...): must be arrays of strings
     for my $key (keys %$filter) {
         if ($key =~ /^#[a-zA-Z]$/) {
@@ -690,7 +726,7 @@ sub serve_nip11 {
         description => $ENV{RELAY_DESCRIPTION} // 'A simple Nostr relay implementation in Perl',
         pubkey => $ENV{RELAY_PUBKEY} // '',
         contact => $ENV{RELAY_CONTACT} // '',
-        supported_nips => [1, 4, 9, 11, 17, 26, 40, 42, 45, 59, 66, 70, 78],
+        supported_nips => [1, 4, 9, 11, 17, 26, 40, 42, 45, 50, 59, 66, 70, 78],
         software => 'perl-nostr-relay',
         version => '0.0.1',
     };
