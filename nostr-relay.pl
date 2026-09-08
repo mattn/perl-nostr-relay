@@ -730,6 +730,11 @@ sub serve_nip11 {
         software => 'perl-nostr-relay',
         version => '0.0.1',
     };
+    # NIP-11 relay_countries: the two letter codes of the jurisdictions the
+    # relay operates under, comma separated in RELAY_COUNTRIES. The key is
+    # left out rather than emitted empty when none are configured.
+    my @countries = grep { length } split /[,\s]+/, ($ENV{RELAY_COUNTRIES} // 'JP');
+    $info->{relay_countries} = \@countries if @countries;
     $info->{url} = $ENV{RELAY_URL} if $ENV{RELAY_URL};
     $info->{icon} = $ENV{RELAY_ICON} if $ENV{RELAY_ICON};
 
