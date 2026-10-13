@@ -788,12 +788,14 @@ tcp_server '0.0.0.0', 8080, sub {
     my $challenge = unpack('H*', sha256(join(':', rand(), time(), $conn_id)));
     my $authenticated_pubkeys = {};
     my $relay_url = $ENV{RELAY_URL} // '';
+    my $ping_timer;
     
     my $handle; $handle = AnyEvent::Handle->new(
         fh => $fh,
         on_error => sub {
             my ($hdl, $fatal, $msg) = @_;
             warnf("Connection error: %s (fatal=%s)", $msg, $fatal) if $fatal;
+            undef $ping_timer;
             # Clean up subscriptions for this connection
             for my $key (keys %$all_subs) {
                 delete $all_subs->{$key} if $key =~ /^\Q$conn_id\E:/;
@@ -802,6 +804,7 @@ tcp_server '0.0.0.0', 8080, sub {
         },
         on_eof => sub {
             infof("Connection closed: %s", $conn_id);
+            undef $ping_timer;
             # Clean up subscriptions for this connection
             for my $key (keys %$all_subs) {
                 delete $all_subs->{$key} if $key =~ /^\Q$conn_id\E:/;
@@ -859,6 +862,10 @@ tcp_server '0.0.0.0', 8080, sub {
                 $handle->push_write(Protocol::WebSocket::Frame->new(
                     encode_json(["AUTH", $challenge])
                 )->to_bytes);
+                # Keep idle connections alive behind proxies (e.g. Cloudflare drops after 100s)
+                $ping_timer = AnyEvent->timer(after => 30, interval => 30, cb => sub {
+                    $handle->push_write(Protocol::WebSocket::Frame->new(type => 'ping', buffer => '')->to_bytes);
+                });
             }
             return;
         }
@@ -872,6 +879,7 @@ tcp_server '0.0.0.0', 8080, sub {
                 next;
             }
             if ($frame->is_close) {
+                undef $ping_timer;
                 $handle->push_write(Protocol::WebSocket::Frame->new(type => 'close')->to_bytes);
                 $handle->push_shutdown;
                 last;
@@ -920,6 +928,7 @@ tcp_server '0.0.0.0', 8080, sub {
         };
         unless ($parsed_ok) {
             warnf("Closing %s due to frame error: %s", $conn_id, $@);
+            undef $ping_timer;
             for my $key (keys %$all_subs) {
                 delete $all_subs->{$key} if $key =~ /^\Q$conn_id\E:/;
             }
