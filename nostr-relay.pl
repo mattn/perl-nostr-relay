@@ -124,7 +124,12 @@ sub build_query {
         if ($key =~ /^#([a-zA-Z])$/) {
             my $tag_name = $1;
             my $values = $filter->{$key};
-            next unless ref $values eq 'ARRAY' && @$values;
+            next unless ref $values eq 'ARRAY';
+            # NIP-01: an empty list matches nothing, not "any value"
+            unless (@$values) {
+                push @where, "FALSE";
+                next;
+            }
             push @where, "(tagvalues && ?::text[] AND EXISTS (SELECT 1 FROM jsonb_array_elements(tags) tag WHERE tag->>0 = ? AND tag->>1 = ANY(?)))";
             push @params, $values, $tag_name, $values;
         }
