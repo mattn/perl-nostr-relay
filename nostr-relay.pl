@@ -587,7 +587,7 @@ sub do_auth {
 
 
 sub do_req {
-    my ($handle, $sid, $filter, $conn_id, $authenticated_pubkeys) = @_;
+    my ($handle, $sid, $filters, $conn_id, $authenticated_pubkeys) = @_;
     
     # Validate subscription id
     if (!defined($sid) || $sid eq '') {
@@ -596,8 +596,8 @@ sub do_req {
         return;
     }
     
-    # Validate filter is an object
-    unless (check_filter($filter)) {
+    # Validate every filter is an object
+    if (grep { !check_filter($_) } @$filters) {
         my $response = Protocol::WebSocket::Frame->new(encode_json(["NOTICE", "invalid: filter must be an object"]))->to_bytes;
         $handle->push_write($response);
         return;
@@ -605,20 +605,26 @@ sub do_req {
     
     my $sub_key = "$conn_id:$sid";
     $all_subs->{$sub_key} = {
-        filter => $filter,
+        filters => $filters,
         handle => $handle,
         authenticated_pubkeys => $authenticated_pubkeys,
     };
 
-    my ($query, $params) = build_query($filter, 0, $authenticated_pubkeys);
+    # NIP-01: filters are OR'd and each filter's limit applies to it alone,
+    # so query them one by one and send an event matched by several once
     my @rows;
+    my %seen;
     eval {
-        my $sth = get_dbh()->prepare($query);
-        $sth->execute(@$params);
-        while (my $row = $sth->fetchrow_hashref) {
-            push @rows, $row;
+        for my $filter (@$filters) {
+            my ($query, $params) = build_query($filter, 0, $authenticated_pubkeys);
+            my $sth = get_dbh()->prepare($query);
+            $sth->execute(@$params);
+            while (my $row = $sth->fetchrow_hashref) {
+                push @rows, $row unless $seen{$row->{id}}++;
+            }
         }
     };
+    @rows = sort { $b->{created_at} <=> $a->{created_at} } @rows;
     if ($@) {
         warnf("Query failed: %s", $@);
         delete $all_subs->{$sub_key};
@@ -686,11 +692,10 @@ sub do_broadcast {
 
     for my $sub_key (keys %$all_subs) {
         my $sub = $all_subs->{$sub_key};
-        my $filter = $sub->{filter};
         my $handle = $sub->{handle};
         
         next unless $handle;
-        next unless match_filter($ev, $filter);
+        next unless grep { match_filter($ev, $_) } @{$sub->{filters}};
         if ($ev->{kind} == 1059) {
             my $auth = $sub->{authenticated_pubkeys} // {};
             my $recipient = grep {
@@ -911,9 +916,10 @@ tcp_server '0.0.0.0', 8080, sub {
             }
             elsif ($type eq 'REQ') {
                 my $sid = $data->[1];
-                my $filter = $data->[2] // {};
+                my @filters = @$data[2 .. $#$data];
+                @filters = ({}) unless @filters;
                 
-                do_req($handle, $sid, $filter, $conn_id, $authenticated_pubkeys);
+                do_req($handle, $sid, \@filters, $conn_id, $authenticated_pubkeys);
             }
             elsif ($type eq 'COUNT') {
                 my $sid = $data->[1];
