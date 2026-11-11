@@ -29,6 +29,10 @@ my %mime_types = (
     ico  => 'image/x-icon',
 );
 
+# NIP-13: minimum proof of work difficulty (leading zero bits of the event
+# id) required for published events; 0 disables the check.
+my $min_pow_difficulty = (($ENV{MIN_POW_DIFFICULTY} // '') =~ /^\s*(-?\d+)/) ? $1 + 0 : 0;
+
 # Database connection
 my $db_url = $ENV{DATABASE_URL} || die "DATABASE_URL not set";
 
@@ -337,6 +341,29 @@ sub verify_delegation_signature {
     return $sig_valid ? 1 : 0;
 }
 
+# NIP-13: count the number of leading zero bits in a hex-encoded event id.
+sub count_leading_zero_bits {
+    my ($hex) = @_;
+    my $count = 0;
+    for my $c (split //, $hex // '') {
+        last unless $c =~ /^[0-9a-fA-F]$/;
+        my $nibble = hex($c);
+        if ($nibble == 0) {
+            $count += 4;
+            next;
+        }
+        if ($nibble <= 1) {
+            $count += 3;
+        } elsif ($nibble <= 3) {
+            $count += 2;
+        } elsif ($nibble <= 7) {
+            $count += 1;
+        }
+        last;
+    }
+    return $count;
+}
+
 sub check_event {
     my ($ev) = @_;
 
@@ -383,6 +410,16 @@ sub do_event {
         my $response = Protocol::WebSocket::Frame->new(encode_json(["OK", $ev->{id}, JSON::PP::false, $delegation_err]))->to_bytes;
         $handle->push_write($response);
         return 0;
+    }
+
+    # NIP-13: enforce proof of work when a minimum difficulty is required.
+    if ($min_pow_difficulty > 0) {
+        my $pow = count_leading_zero_bits($ev->{id});
+        if ($pow < $min_pow_difficulty) {
+            my $response = Protocol::WebSocket::Frame->new(encode_json(["OK", $ev->{id}, JSON::PP::false, "pow: difficulty $pow is less than $min_pow_difficulty"]))->to_bytes;
+            $handle->push_write($response);
+            return 0;
+        }
     }
 
     # NIP-70: protected events require authentication as their author.
@@ -736,9 +773,12 @@ sub serve_nip11 {
         description => $ENV{RELAY_DESCRIPTION} // 'A simple Nostr relay implementation in Perl',
         pubkey => $ENV{RELAY_PUBKEY} // '',
         contact => $ENV{RELAY_CONTACT} // '',
-        supported_nips => [1, 4, 9, 11, 17, 26, 40, 42, 45, 50, 59, 66, 70, 78],
+        supported_nips => [1, 4, 9, 11, 13, 17, 26, 40, 42, 45, 50, 59, 66, 70, 78],
         software => 'perl-nostr-relay',
         version => '0.0.1',
+        limitation => {
+            min_pow_difficulty => $min_pow_difficulty,
+        },
     };
     # NIP-11 relay_countries: the two letter codes of the jurisdictions the
     # relay operates under, comma separated in RELAY_COUNTRIES. The key is
