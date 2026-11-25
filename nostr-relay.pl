@@ -59,6 +59,23 @@ sub get_dbh {
     return $dbh;
 }
 
+# NIP-40: SQL condition that is true for events whose expiration has passed.
+# The placeholder is the current unix time. The @> check lets events without
+# an expiration tag skip the subquery.
+my $EXPIRED_SQL = q{(tags @> '[["expiration"]]' AND EXISTS (SELECT 1 FROM jsonb_array_elements(tags) tag WHERE tag->>0 = 'expiration' AND CASE WHEN tag->>1 ~ '^[0-9]{1,18}$' THEN (tag->>1)::bigint END <= ?))};
+
+# NIP-40: the expiration timestamp of an event, or undef when it has none.
+# Malformed values are ignored.
+sub get_expiration {
+    my ($ev) = @_;
+    for my $tag (@{$ev->{tags} // []}) {
+        next unless ref $tag eq 'ARRAY' && ($tag->[0] // '') eq 'expiration';
+        my $value = $tag->[1] // '';
+        return ($value =~ /^\d{1,18}$/) ? $value + 0 : undef;
+    }
+    return undef;
+}
+
 # Global subscriptions across all connections
 my $all_subs = {};
 my $conn_counter = 0;
@@ -83,6 +100,10 @@ sub build_query {
     my ($filter, $count_only, $authenticated_pubkeys) = @_;
     my @where;
     my @params;
+
+    # NIP-40: never return expired events
+    push @where, "NOT $EXPIRED_SQL";
+    push @params, time();
     
     if ($filter->{ids}) {
         push @where, "id = ANY(?)";
@@ -428,6 +449,14 @@ sub do_event {
     } @{$ev->{tags} // []};
     if ($protected && !$authenticated_pubkeys->{$ev->{pubkey}}) {
         my $response = Protocol::WebSocket::Frame->new(encode_json(["OK", $ev->{id}, JSON::PP::false, "auth-required: this event may only be published by its author"]))->to_bytes;
+        $handle->push_write($response);
+        return 0;
+    }
+
+    # NIP-40: an event that has already expired is not accepted.
+    my $expiration = get_expiration($ev);
+    if (defined $expiration && $expiration <= time()) {
+        my $response = Protocol::WebSocket::Frame->new(encode_json(["OK", $ev->{id}, JSON::PP::false, "invalid: event has expired"]))->to_bytes;
         $handle->push_write($response);
         return 0;
     }
